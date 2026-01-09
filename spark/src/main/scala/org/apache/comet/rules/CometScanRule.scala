@@ -572,6 +572,25 @@ case class CometScanRule(session: SparkSession) extends Rule[SparkPlan] with Com
       partitionSchema: StructType,
       hadoopConf: Configuration): String = {
 
+    val cometExecEnabled = COMET_EXEC_ENABLED.get()
+
+    // Prefer native_datafusion for queries with Dynamic Partition Pruning (DPP)
+    // because it provides significant I/O reduction through partition filtering
+    val hasDPP = scanExec.partitionFilters.exists(isDynamicPruningFilter)
+    if (hasDPP && cometExecEnabled) {
+      val dppFallbackReasons = new ListBuffer[String]()
+      val typeChecker = CometScanTypeChecker(SCAN_NATIVE_DATAFUSION)
+      val schemaSupported =
+        typeChecker.isSchemaSupported(scanExec.requiredSchema, dppFallbackReasons)
+      val partitionSchemaSupported =
+        typeChecker.isSchemaSupported(partitionSchema, dppFallbackReasons)
+
+      if (schemaSupported && partitionSchemaSupported && dppFallbackReasons.isEmpty) {
+        logInfo(s"Auto scan mode selecting $SCAN_NATIVE_DATAFUSION for DPP query")
+        return SCAN_NATIVE_DATAFUSION
+      }
+    }
+
     val fallbackReasons = new ListBuffer[String]()
 
     // native_iceberg_compat only supports local filesystem and S3
@@ -592,7 +611,6 @@ case class CometScanRule(session: SparkSession) extends Rule[SparkPlan] with Com
     val partitionSchemaSupported =
       typeChecker.isSchemaSupported(partitionSchema, fallbackReasons)
 
-    val cometExecEnabled = COMET_EXEC_ENABLED.get()
     if (!cometExecEnabled) {
       fallbackReasons += s"$SCAN_NATIVE_ICEBERG_COMPAT requires ${COMET_EXEC_ENABLED.key}=true"
     }
