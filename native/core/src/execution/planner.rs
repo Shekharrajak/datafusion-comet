@@ -113,12 +113,13 @@ use datafusion_comet_proto::spark_operator::SparkFilePartition;
 use datafusion_comet_proto::{
     spark_expression::{
         self, agg_expr::ExprStruct as AggExprStruct, expr::ExprStruct, literal::Value, AggExpr,
-        Expr, ScalarFunc,
+        Expr, Literal as ProtoLiteral, ScalarFunc,
     },
     spark_operator::{
         self, lower_window_frame_bound::LowerFrameBoundStruct, operator::OpStruct,
         upper_window_frame_bound::UpperFrameBoundStruct, BuildSide,
-        CompressionCodec as SparkCompressionCodec, JoinType, Operator, WindowFrameType,
+        CompressionCodec as SparkCompressionCodec, JoinType, Operator, RuntimeFilterBound,
+        WindowFrameType,
     },
     spark_partitioning::{partitioning::PartitioningStruct, Partitioning as SparkPartitioning},
 };
@@ -243,6 +244,124 @@ impl PhysicalPlanner {
         })?;
 
         Ok(files)
+    }
+
+    /// Create a predicate expression from a runtime filter bound
+    /// This converts runtime filter bounds (min/max or IN values) into DataFusion predicates
+    /// that can be pushed down to Parquet for row-group pruning
+    fn create_runtime_filter_predicate(
+        &self,
+        rf_bound: &RuntimeFilterBound,
+        schema: SchemaRef,
+    ) -> Result<Option<Arc<dyn PhysicalExpr>>, ExecutionError> {
+        use datafusion::physical_expr::expressions::BinaryExpr;
+        use datafusion::logical_expr::Operator;
+
+        let column_name = &rf_bound.column_name;
+        let column_idx = rf_bound.column_index as usize;
+
+        // Check if column exists in schema
+        if column_idx >= schema.fields().len() {
+            return Ok(None);
+        }
+
+        let column_expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new(column_name, column_idx));
+
+        match rf_bound.filter_type.as_str() {
+            "minmax" => {
+                // Create range predicate: column >= min AND column <= max
+                let mut predicates: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+
+                if let Some(min_lit) = &rf_bound.min_value {
+                    if let Ok(min_expr) = self.create_literal_expr(min_lit) {
+                        let ge_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                            Arc::clone(&column_expr),
+                            Operator::GtEq,
+                            min_expr,
+                        ));
+                        predicates.push(ge_expr);
+                    }
+                }
+
+                if let Some(max_lit) = &rf_bound.max_value {
+                    if let Ok(max_expr) = self.create_literal_expr(max_lit) {
+                        let le_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                            Arc::clone(&column_expr),
+                            Operator::LtEq,
+                            max_expr,
+                        ));
+                        predicates.push(le_expr);
+                    }
+                }
+
+                if predicates.is_empty() {
+                    return Ok(None);
+                }
+
+                // Combine with AND
+                let mut result = predicates[0].clone();
+                for pred in predicates.into_iter().skip(1) {
+                    result = Arc::new(BinaryExpr::new(result, Operator::And, pred));
+                }
+
+                Ok(Some(result))
+            }
+            "in" => {
+                // For IN filters, create OR of equality checks for small lists
+                // or fall back to min/max bounds for larger lists
+                if rf_bound.in_values.len() <= 10 && !rf_bound.in_values.is_empty() {
+                    let mut or_expr: Option<Arc<dyn PhysicalExpr>> = None;
+
+                    for value in &rf_bound.in_values {
+                        if let Ok(literal_expr) = self.create_literal_expr(value) {
+                            let eq_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+                                Arc::clone(&column_expr),
+                                Operator::Eq,
+                                literal_expr,
+                            ));
+
+                            or_expr = Some(match or_expr {
+                                Some(existing) => Arc::new(BinaryExpr::new(
+                                    existing,
+                                    Operator::Or,
+                                    eq_expr,
+                                )),
+                                None => eq_expr,
+                            });
+                        }
+                    }
+
+                    Ok(or_expr)
+                } else {
+                    // Fall back to min/max bounds if available
+                    self.create_runtime_filter_predicate(
+                        &RuntimeFilterBound {
+                            column_name: rf_bound.column_name.clone(),
+                            column_index: rf_bound.column_index,
+                            min_value: rf_bound.min_value.clone(),
+                            max_value: rf_bound.max_value.clone(),
+                            in_values: vec![],
+                            filter_type: "minmax".to_string(),
+                        },
+                        schema,
+                    )
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Helper to create a literal expression from protobuf Literal
+    fn create_literal_expr(
+        &self,
+        literal: &ProtoLiteral,
+    ) -> Result<Arc<dyn PhysicalExpr>, ExecutionError> {
+        let empty_schema = Arc::new(Schema::empty());
+        // Create an Expr wrapper for the literal
+        let expr = Expr {
+            expr_struct: Some(ExprStruct::Literal(literal.clone())),
+        };
+        self.create_expr(&expr, empty_schema)
     }
 
     /// Create a DataFusion physical expression from Spark physical expression
@@ -1028,11 +1147,20 @@ impl PhysicalPlanner {
                 }
 
                 // Convert the Spark expressions to Physical expressions
-                let data_filters: Result<Vec<Arc<dyn PhysicalExpr>>, ExecutionError> = scan
+                let mut data_filters: Vec<Arc<dyn PhysicalExpr>> = scan
                     .data_filters
                     .iter()
                     .map(|expr| self.create_expr(expr, Arc::clone(&required_schema)))
-                    .collect();
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                // Add runtime filter bounds as additional predicates for row-group pruning
+                for rf_bound in &scan.runtime_filter_bounds {
+                    if let Some(predicate) =
+                        self.create_runtime_filter_predicate(rf_bound, Arc::clone(&required_schema))?
+                    {
+                        data_filters.push(predicate);
+                    }
+                }
 
                 let default_values: Option<HashMap<usize, ScalarValue>> = if !scan
                     .default_values
@@ -1108,7 +1236,7 @@ impl PhysicalPlanner {
                     object_store_url,
                     file_groups,
                     Some(projection_vector),
-                    Some(data_filters?),
+                    Some(data_filters),
                     default_values,
                     scan.session_timezone.as_str(),
                     scan.case_sensitive,

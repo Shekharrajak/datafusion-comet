@@ -22,6 +22,7 @@ syntax = "proto3";
 package spark.spark_operator;
 
 import "expr.proto";
+import "literal.proto";
 import "partitioning.proto";
 import "types.proto";
 
@@ -108,6 +109,26 @@ message NativeScan {
   // the map.
   map<string, string> object_store_options = 13;
   bool encryption_enabled = 14;
+  // Runtime filter bounds for row-group pruning
+  // These are pushed down from join operators to enable I/O reduction
+  repeated RuntimeFilterBound runtime_filter_bounds = 15;
+}
+
+// Runtime filter bound for a specific column
+// Used to prune row groups during Parquet scan based on min/max statistics
+message RuntimeFilterBound {
+  // Column name to apply the filter on
+  string column_name = 1;
+  // Column index in the schema
+  int32 column_index = 2;
+  // Min value bound (optional, for range filters)
+  optional spark.spark_expression.Literal min_value = 3;
+  // Max value bound (optional, for range filters)
+  optional spark.spark_expression.Literal max_value = 4;
+  // IN values (optional, for exact match filters with small cardinality)
+  repeated spark.spark_expression.Literal in_values = 5;
+  // Filter type: "minmax", "in", or "bloom"
+  string filter_type = 6;
 }
 
 message IcebergScan {
@@ -272,6 +293,44 @@ message HashJoin {
   JoinType join_type = 3;
   optional spark.spark_expression.Expr condition = 4;
   BuildSide build_side = 5;
+  // Runtime filter configuration for this join
+  optional RuntimeFilterConfig runtime_filter_config = 6;
+}
+
+// Configuration for runtime filter generation during hash join
+message RuntimeFilterConfig {
+  // Whether to generate runtime filters from this join's build side
+  bool enabled = 1;
+  // Type of filter to generate
+  RuntimeFilterType filter_type = 2;
+  // Maximum number of distinct values for IN filter
+  int32 in_filter_threshold = 3;
+  // Column index in build side to collect values from
+  int32 build_key_index = 4;
+  // Target scan operator ID to push the filter to
+  uint32 target_scan_id = 5;
+}
+
+enum RuntimeFilterType {
+  IN_FILTER = 0;
+  MIN_MAX_FILTER = 1;
+  BLOOM_FILTER = 2;
+}
+
+// Runtime filter data passed from build side to probe side
+message RuntimeFilterData {
+  // Type of filter
+  RuntimeFilterType filter_type = 1;
+  // Filter identifier
+  string filter_id = 2;
+  // Serialized filter data (format depends on filter_type)
+  bytes filter_bytes = 3;
+  // For MIN_MAX filter: minimum value
+  optional spark.spark_expression.Literal min_value = 4;
+  // For MIN_MAX filter: maximum value
+  optional spark.spark_expression.Literal max_value = 5;
+  // For IN filter: list of values (when small enough to inline)
+  repeated spark.spark_expression.Literal in_values = 6;
 }
 
 message SortMergeJoin {
