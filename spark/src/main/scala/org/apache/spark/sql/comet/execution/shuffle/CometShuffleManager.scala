@@ -194,13 +194,23 @@ class CometShuffleManager(conf: SparkConf) extends ShuffleManager with Logging {
     if (handle.isInstanceOf[CometBypassMergeSortShuffleHandle[_, _]] ||
       handle.isInstanceOf[CometSerializedShuffleHandle[_, _]] ||
       handle.isInstanceOf[CometNativeShuffleHandle[_, _]]) {
-      new CometBlockStoreShuffleReader(
-        handle.asInstanceOf[BaseShuffleHandle[K, _, C]],
-        blocksByAddress,
-        context,
-        metrics,
-        shouldBatchFetch =
-          canEnableBatchFetch && canUseBatchFetch(startPartition, endPartition, context))
+      val useFlightTransport = CometConf.COMET_SHUFFLE_TRANSPORT.get() == "flight"
+
+      if (useFlightTransport && handle.isInstanceOf[CometNativeShuffleHandle[_, _]]) {
+        new CometFlightShuffleReader(
+          handle.asInstanceOf[BaseShuffleHandle[K, _, C]],
+          blocksByAddress,
+          context,
+          metrics)
+      } else {
+        new CometBlockStoreShuffleReader(
+          handle.asInstanceOf[BaseShuffleHandle[K, _, C]],
+          blocksByAddress,
+          context,
+          metrics,
+          shouldBatchFetch =
+            canEnableBatchFetch && canUseBatchFetch(startPartition, endPartition, context))
+      }
     } else {
       // It is a Spark shuffle dependency, so we use Spark Sort Shuffle Reader.
       sortShuffleManager.getReader(

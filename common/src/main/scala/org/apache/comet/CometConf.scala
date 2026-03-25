@@ -366,6 +366,28 @@ object CometConf extends ShimCometConf {
     .checkValues(Set("native", "jvm", "auto"))
     .createWithDefault("auto")
 
+  val COMET_SHUFFLE_TRANSPORT: ConfigEntry[String] =
+    conf(s"$COMET_EXEC_CONFIG_PREFIX.shuffle.transport")
+      .category(CATEGORY_SHUFFLE)
+      .doc(
+        "Transport protocol for shuffle data between executors. " +
+          "'netty' uses Spark's built-in Netty BlockTransferService (default). " +
+          "'flight' uses an embedded Arrow Flight server for direct native-to-native transfer, " +
+          "bypassing the JVM in the shuffle data path.")
+      .stringConf
+      .transform(_.toLowerCase(Locale.ROOT))
+      .checkValues(Set("netty", "flight"))
+      .createWithDefault("netty")
+
+  val COMET_SHUFFLE_FLIGHT_PORT: ConfigEntry[Int] =
+    conf(s"$COMET_EXEC_CONFIG_PREFIX.shuffle.flight.port")
+      .category(CATEGORY_SHUFFLE)
+      .doc(
+        "Port for the Arrow Flight shuffle server on each executor. " +
+          "0 means auto-assign an available port.")
+      .intConf
+      .createWithDefault(0)
+
   val COMET_EXEC_BROADCAST_FORCE_ENABLED: ConfigEntry[Boolean] =
     conf(s"$COMET_EXEC_CONFIG_PREFIX.broadcast.enabled")
       .category(CATEGORY_EXEC)
