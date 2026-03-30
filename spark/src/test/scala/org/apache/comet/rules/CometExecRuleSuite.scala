@@ -274,6 +274,92 @@ class CometExecRuleSuite extends CometTestBase {
       "First should not support mixed execution (default false)")
   }
 
+  test("containsMapType detects map in top-level MapType") {
+    // Regression test for https://github.com/apache/datafusion-comet/issues/2894
+    // The containsMapType helper in CometBaseAggregate must detect MapType at the top level.
+    val mapType = DataTypes.createMapType(DataTypes.IntegerType, DataTypes.IntegerType)
+    assert(CometHashAggregateExec.containsMapType(mapType))
+  }
+
+  test("containsMapType detects map nested in ArrayType") {
+    // Regression test for https://github.com/apache/datafusion-comet/issues/2894
+    // ARRAY(MAP(...)) must be detected - this was the exact CI failure in group-by.sql #82.
+    val mapType = DataTypes.createMapType(DataTypes.IntegerType, DataTypes.IntegerType)
+    val arrayOfMap = DataTypes.createArrayType(mapType)
+    assert(CometHashAggregateExec.containsMapType(arrayOfMap))
+    // Plain array without map should NOT be flagged
+    val arrayOfInt = DataTypes.createArrayType(DataTypes.IntegerType)
+    assert(!CometHashAggregateExec.containsMapType(arrayOfInt))
+  }
+
+  test("containsMapType detects map nested in StructType") {
+    // Regression test for https://github.com/apache/datafusion-comet/issues/2894
+    // STRUCT containing a MapType field must also be detected.
+    val mapType = DataTypes.createMapType(DataTypes.IntegerType, DataTypes.IntegerType)
+    val structWithMap = StructType(Array(StructField("m", mapType, nullable = true)))
+    assert(CometHashAggregateExec.containsMapType(structWithMap))
+    // Struct with only primitive fields should NOT be flagged
+    val structNoMap = StructType(
+      Array(
+        StructField("x", DataTypes.IntegerType, nullable = true),
+        StructField("y", DataTypes.StringType, nullable = true)))
+    assert(!CometHashAggregateExec.containsMapType(structNoMap))
+  }
+
+  test("containsMapType detects map in deeply nested ArrayType containing StructType") {
+    // Regression test for https://github.com/apache/datafusion-comet/issues/2894
+    // Deep nesting: ARRAY(STRUCT(MAP(...))) must also be caught.
+    val mapType = DataTypes.createMapType(DataTypes.IntegerType, DataTypes.IntegerType)
+    val structWithMap = StructType(Array(StructField("m", mapType, nullable = true)))
+    val arrayOfStructWithMap = DataTypes.createArrayType(structWithMap)
+    assert(CometHashAggregateExec.containsMapType(arrayOfStructWithMap))
+  }
+
+  test("containsMapType returns false for primitive types") {
+    // Regression test for https://github.com/apache/datafusion-comet/issues/2894
+    // Primitive types must not trigger the fallback.
+    assert(!CometHashAggregateExec.containsMapType(DataTypes.IntegerType))
+    assert(!CometHashAggregateExec.containsMapType(DataTypes.StringType))
+    assert(!CometHashAggregateExec.containsMapType(DataTypes.LongType))
+    assert(!CometHashAggregateExec.containsMapType(DataTypes.DoubleType))
+  }
+
+  test("CometExecRule should NOT fall back aggregate for GROUP BY plain ArrayType") {
+    // Grouping by ARRAY(int) should be handled by Comet (no maps involved).
+    // See https://github.com/apache/datafusion-comet/issues/2894
+    withTempView("test_data") {
+      createTestDataFrame.createOrReplaceTempView("test_data")
+      val sparkPlan =
+        createSparkPlan(spark, "SELECT COUNT(*) FROM test_data GROUP BY ARRAY(id, id+1)")
+      withSQLConf(
+        CometConf.COMET_ENABLED.key -> "true",
+        CometConf.COMET_EXEC_LOCAL_TABLE_SCAN_ENABLED.key -> "true") {
+        val transformedPlan = applyCometExecRule(sparkPlan)
+        // Should use Comet - plain array with no maps
+        assert(countOperators(transformedPlan, classOf[CometHashAggregateExec]) > 0)
+        assert(countOperators(transformedPlan, classOf[HashAggregateExec]) == 0)
+      }
+    }
+  }
+
+  test("CometExecRule should NOT fall back aggregate for GROUP BY StructType without MapType") {
+    // Grouping by a struct with only primitive fields should be handled by Comet.
+    // See https://github.com/apache/datafusion-comet/issues/2894
+    withTempView("test_data") {
+      createTestDataFrame.createOrReplaceTempView("test_data")
+      val sparkPlan =
+        createSparkPlan(spark, "SELECT COUNT(*) FROM test_data GROUP BY STRUCT(id, name)")
+      withSQLConf(
+        CometConf.COMET_ENABLED.key -> "true",
+        CometConf.COMET_EXEC_LOCAL_TABLE_SCAN_ENABLED.key -> "true") {
+        val transformedPlan = applyCometExecRule(sparkPlan)
+        // Should use Comet - struct has only primitive fields, no maps
+        assert(countOperators(transformedPlan, classOf[CometHashAggregateExec]) > 0)
+        assert(countOperators(transformedPlan, classOf[HashAggregateExec]) == 0)
+      }
+    }
+  }
+
   test("CometExecRule should apply broadcast exchange transformations") {
     withTempView("test_data") {
       createTestDataFrame.createOrReplaceTempView("test_data")

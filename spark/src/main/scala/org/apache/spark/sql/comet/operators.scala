@@ -1335,6 +1335,20 @@ case class CometUnionExec(
 
 trait CometBaseAggregate {
 
+  /**
+   * Recursively checks if a DataType contains a MapType at any nesting level. Comet native cannot
+   * handle grouping by types that contain maps (e.g. MapType, ArrayType(MapType), StructType with
+   * a MapType field) because the row format does not support List(Map(...)).
+   *
+   * See https://github.com/apache/datafusion-comet/issues/2894
+   */
+  def containsMapType(dt: DataType): Boolean = dt match {
+    case _: MapType => true
+    case a: ArrayType => containsMapType(a.elementType)
+    case s: StructType => s.fields.exists(f => containsMapType(f.dataType))
+    case _ => false
+  }
+
   def doConvert(
       aggregate: BaseAggregateExec,
       builder: Operator.Builder,
@@ -1371,12 +1385,6 @@ trait CometBaseAggregate {
       return None
     }
 
-    def containsMapType(dt: DataType): Boolean = dt match {
-      case _: MapType => true
-      case a: ArrayType => containsMapType(a.elementType)
-      case s: StructType => s.fields.exists(f => containsMapType(f.dataType))
-      case _ => false
-    }
     val mapTypeGroupings =
       groupingExpressions.filter(expr => containsMapType(expr.dataType))
     if (mapTypeGroupings.nonEmpty) {

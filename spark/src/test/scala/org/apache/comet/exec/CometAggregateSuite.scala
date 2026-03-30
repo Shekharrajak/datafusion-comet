@@ -1993,6 +1993,46 @@ class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
       s"Expected $numAggregates Comet aggregate operators, but found $actualNumAggregates")
   }
 
+  test("GROUP BY nested map types should fall back to Spark and produce correct results") {
+    // Regression test for https://github.com/apache/datafusion-comet/issues/2894
+    // Comet native cannot handle grouping by types that contain maps at any nesting level.
+    // Verify that results are correct (match vanilla Spark) even when falling back.
+
+    // Case 1: GROUP BY top-level MapType
+    checkSparkAnswer(
+      "SELECT count(*) FROM VALUES (MAP(1, 2)), (MAP(3, 4)), (MAP(1, 2)) AS t(m) GROUP BY m")
+
+    // Case 2: GROUP BY ARRAY(MAP(...)) - the original CI failure case from group-by.sql
+    checkSparkAnswer(
+      "SELECT count(*) FROM " +
+        "VALUES (ARRAY(MAP(1, 2, 2, 3), MAP(1, 3))), " +
+        "(ARRAY(MAP(1, 2))), " +
+        "(ARRAY(MAP(1, 2, 2, 3), MAP(1, 3))) AS t(a) " +
+        "GROUP BY a")
+
+    // Case 3: GROUP BY STRUCT containing a MapType field
+    checkSparkAnswer(
+      "SELECT count(*) FROM " +
+        "VALUES (NAMED_STRUCT('m', MAP(1, 2))), " +
+        "(NAMED_STRUCT('m', MAP(3, 4))), " +
+        "(NAMED_STRUCT('m', MAP(1, 2))) AS t(s) " +
+        "GROUP BY s")
+
+    // Case 4: GROUP BY plain ARRAY(int) - should use Comet (positive case)
+    checkSparkAnswerAndOperator(
+      "SELECT count(*) FROM " +
+        "VALUES (ARRAY(1, 2)), (ARRAY(3, 4)), (ARRAY(1, 2)) AS t(a) " +
+        "GROUP BY a")
+
+    // Case 5: GROUP BY STRUCT with only primitive fields - should use Comet (positive case)
+    checkSparkAnswerAndOperator(
+      "SELECT count(*) FROM " +
+        "VALUES (NAMED_STRUCT('x', 1, 'y', 2)), " +
+        "(NAMED_STRUCT('x', 3, 'y', 4)), " +
+        "(NAMED_STRUCT('x', 1, 'y', 2)) AS t(s) " +
+        "GROUP BY s")
+  }
+
   protected def checkSparkAnswerWithTolAndNumOfAggregates(
       query: String,
       numAggregates: Int,
