@@ -702,6 +702,79 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn reads_name_mapped_struct_with_primitive_projection() {
+        use arrow::array::{ArrayRef, Int32Array, RecordBatch, StructArray};
+        use arrow::datatypes::{DataType, Field};
+        use datafusion::execution::TaskContext;
+        use datafusion::physical_plan::collect;
+        use parquet::arrow::ArrowWriter;
+
+        let batch = |child_name: &str| {
+            let ids = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+            let child = Arc::new(Int32Array::from(vec![Some(11), None])) as ArrayRef;
+            let nested = StructArray::from(vec![(
+                Arc::new(Field::new(child_name, DataType::Int32, true)),
+                child,
+            )]);
+            RecordBatch::try_from_iter([("id", ids), ("s", Arc::new(nested) as ArrayRef)]).unwrap()
+        };
+        let input = batch("old_x");
+        let expected = batch("x");
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("data.parquet");
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, input.schema(), None).unwrap();
+        writer.write(&input).unwrap();
+        writer.close().unwrap();
+
+        let schema = serde_json::from_str::<Schema>(
+            r#"{"type":"struct","schema-id":0,"fields":[
+                {"id":1,"name":"id","required":true,"type":"int"},
+                {"id":2,"name":"s","required":true,"type":{"type":"struct","fields":[
+                    {"id":3,"name":"x","required":false,"type":"int"}
+                ]}}
+            ]}"#,
+        )
+        .unwrap();
+        let name_mapping = serde_json::from_str(
+            r#"[
+                {"field-id":1,"names":["id"]},
+                {"field-id":2,"names":["s"],"fields":[{"field-id":3,"names":["x","old_x"]}]}
+            ]"#,
+        )
+        .unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(size)
+            .with_start(0)
+            .with_length(size)
+            .with_data_file_path(path.to_str().unwrap().to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(Arc::new(schema))
+            .with_project_field_ids(vec![1, 2])
+            .with_name_mapping(Some(Arc::new(name_mapping)))
+            .with_deletes(vec![])
+            .with_case_sensitive(true)
+            .build()
+            .unwrap();
+        let scan = IcebergScanExec::new(
+            format!("file:{}/metadata.json", directory.path().display()),
+            expected.schema(),
+            Default::default(),
+            String::new(),
+            vec![task],
+            1,
+        )
+        .unwrap();
+
+        let batches = collect(Arc::new(scan), Arc::new(TaskContext::default()))
+            .await
+            .unwrap();
+        assert_eq!(batches, vec![expected]);
+    }
+
     fn task_with_deletes(deletes: Vec<FileScanTaskDeleteFile>) -> FileScanTask {
         FileScanTask::builder()
             .with_file_size_in_bytes(0)
