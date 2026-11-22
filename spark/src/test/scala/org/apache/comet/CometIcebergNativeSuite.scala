@@ -2723,7 +2723,10 @@ class CometIcebergNativeSuite
               assert(table.schemas().size() == 1)
               for (pruning <- Seq(false, true)) {
                 withSQLConf(
-                  "spark.sql.optimizer.nestedSchemaPruning.enabled" -> pruning.toString) {
+                  "spark.sql.optimizer.nestedSchemaPruning.enabled" -> pruning.toString,
+                  CometConf.COMET_ICEBERG_NESTED_SCHEMA_PRUNING_ENABLED.key -> pruning.toString) {
+                  val mixedProjection =
+                    s"SELECT id, s.x, items.x, m['k'].nested.x FROM $destName WHERE id = 1"
                   // Also read a mapped sibling to cover partial map-value projection.
                   val projections = Seq(
                     "s IS NULL, items IS NULL, m IS NULL",
@@ -2733,9 +2736,13 @@ class CometIcebergNativeSuite
                     "m['k'].nested",
                     "id, s, items, m")
                   val queries = projections.map(p => s"SELECT $p FROM $destName") ++ Seq(
+                    mixedProjection,
                     s"SELECT id FROM $destName WHERE s.x = 11",
                     s"SELECT id FROM $destName WHERE m['k'].anchor = 44")
                   withClue(s"physicalName=$physicalName alias=$alias pruning=$pruning: ") {
+                    if (physicalName == "x" || alias) {
+                      checkAnswer(spark.sql(mixedProjection), Row(1, 11, Seq(22), 33))
+                    }
                     for (query <- queries) {
                       val (_, plan) = checkSparkAnswerAndFallbackReason(
                         query,
