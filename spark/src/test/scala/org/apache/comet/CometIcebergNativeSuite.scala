@@ -3433,12 +3433,7 @@ class CometIcebergNativeSuite
     }
   }
 
-  // A table migrated from Spark-written Parquet reads its files, which have no field ids, through
-  // its name mapping. iceberg-rust cannot open the list layout that `spark.sql.parquet.writeLegacyFormat`
-  // writes (a two-level list) through a name mapping: the read schema it supplies keeps a field
-  // id on the list's element field and the Parquet reader rejects it. The layout is only known
-  // from the file, so the scan falls back for the list column and stays native for the primitives.
-  test("name-mapped table with a list column from a legacy Parquet layout falls back") {
+  test("name-mapped three-level legacy Parquet list falls back") {
     assume(icebergAvailable, "Iceberg not available in classpath")
 
     withTempIcebergDir { warehouseDir =>
@@ -3451,26 +3446,23 @@ class CometIcebergNativeSuite
         CometConf.COMET_ICEBERG_NATIVE_ENABLED.key -> "true") {
 
         val dataPath = s"${warehouseDir.getAbsolutePath}/legacy_list"
-        // Non-null elements and a non-null struct field: with `writeLegacyFormat` Spark then writes
-        // the two-level layout, `repeated group array { required int32 col2 }`, the list's
-        // element being the repeated group itself.
-        val sparkSchema = StructType(
-          Seq(
-            org.apache.spark.sql.types.StructField("id", IntegerType, nullable = false),
-            org.apache.spark.sql.types.StructField(
-              "col1",
-              ArrayType(
-                StructType(Seq(
-                  org.apache.spark.sql.types.StructField("col2", IntegerType, nullable = false))),
-                containsNull = false))))
-        val jsonRows = (0 until 10).map(i => s"""{"id": $i, "col1": [{"col2": ${i * 2}}]}""")
-        withSQLConf("spark.sql.parquet.writeLegacyFormat" -> "true") {
-          spark.read
-            .schema(sparkSchema)
-            .json(spark.createDataset(jsonRows)(org.apache.spark.sql.Encoders.STRING))
-            .coalesce(1)
+        val sparkSchema = StructType.fromDDL("id INT, col1 ARRAY<STRUCT<col2: INT>>")
+        val rows = (0 until 10).map(i => Row(i, Seq(Row(i * 2))))
+        withSQLConf(
+          CometConf.COMET_ENABLED.key -> "false",
+          "spark.sql.parquet.writeLegacyFormat" -> "true") {
+          spark
+            .createDataFrame(spark.sparkContext.parallelize(rows, 1), sparkSchema)
             .write
             .parquet(dataPath)
+        }
+        val parquetFile = new File(dataPath).listFiles().find(_.getName.endsWith(".parquet")).get
+        withParquetReader(parquetFile.getAbsolutePath) { reader =>
+          val fileSchema = reader.getFooter.getFileMetaData.getSchema
+          assert(
+            fileSchema.getColumns.asScala
+              .exists(_.getPath.toSeq == Seq("col1", "bag", "array", "col2")),
+            s"Expected a three-level legacy Parquet list in $fileSchema")
         }
         spark.sql("CREATE NAMESPACE IF NOT EXISTS test_cat.db")
         val table = "test_cat.db.legacy_list"
